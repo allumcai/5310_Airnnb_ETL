@@ -1,0 +1,397 @@
+---
+title: "Airbnb Relational Database"
+author: "Devin Clementi, Allum Cai"
+date: "4/12/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Set Working Directory to Source File Location
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+``` {r libraries}
+# Import packages
+## RPostgreSQL (and dbDriver('PostgreSQL')) leads to fatal error for some odd reason
+## So, I used RPostgres (and dbDriver('Postgres')) instead
+library(RPostgres)
+library(data.table)
+library(dplyr)
+```
+
+``` {r load_data}
+# Load data into data.tables
+sessions <- fread('sessions.csv', na.strings = c('', NA))
+countries <- fread('countries.csv', na.strings = c('', NA))
+age.gender.buckets <- fread('age_gender_bkts.csv', na.strings = c('', NA))
+train <- fread('train_users_2.csv', na.strings = c('', NA))
+test <- fread('test_users.csv', na.strings = c('', NA))
+```
+
+``` {r explore_data}
+# Check structure of each data.table
+str(sessions)
+str(countries)
+str(age.gender.buckets)
+str(train)
+str(test)
+
+# Check for nulls
+colSums(is.na(sessions))
+colSums(is.na(countries))
+colSums(is.na(age.gender.buckets))
+```
+
+``` {r clean_data}
+# Remove NULLS/NAs from sessions
+sessions <- na.omit(sessions, cols = 'user_id')
+
+# Change date_first_booking column to Date type
+train$date_first_booking <- as.Date(train$date_first_booking)
+test$date_first_booking <- as.Date(test$date_first_booking)
+
+# Merge train and test data for database
+
+## Create country_destination in test data to match columns with train
+test[, country_destination := NA]
+
+## Change country_destination column in test to character type
+test$country_destination <- as.character(test$country_destination)
+
+# Merge
+users <- merge(train, test, all = TRUE)
+
+# Check users for nulls
+colSums(is.na(users))
+
+# Double-check first_affiliate_tracked
+table(users$first_affiliate_tracked)
+
+# Change first_affiliate_tracked == '' to NA
+users[first_affiliate_tracked == '']$first_affiliate_tracked <- NA
+
+# Check users for nulls again
+colSums(is.na(users))
+
+# Find max age of users
+max(users$age, na.rm = TRUE)
+
+# Find minimum age of users
+min(users$age, na.rm = TRUE)
+
+# Find range of age in users
+range(users$age, na.rm = TRUE)
+
+# Fine mean age of users to nearest year (use ceiling to round up if slightly above a certain number)
+ceiling(mean(users$age, na.rm = TRUE))
+
+# Impute ages over 100 with mean age
+users[age > 100]$age <- ceiling(mean(users$age, na.rm = TRUE))
+
+# Impute ages under 18 with min age (18 years old)
+users[age < 18]$age <- 18
+
+# Check listed languages in countries and users tables
+table(countries$destination_language)
+table(users$language)
+
+# Check listed devices in sessions and users tables
+table(sessions$device_type)
+table(users$first_device_type)
+```
+
+``` {r create_normalized_tables}
+# Create IDs for attributes to begin transition into 3NF
+users$channel_id <- users %>% group_by(affiliate_channel) %>% group_indices()
+users$provider_id <- users %>% group_by(affiliate_provider) %>% group_indices()
+users$channel_provider_id <- users %>% group_by(channel_id, provider_id) %>% group_indices()
+users$browser_id <- users %>% group_by(first_browser) %>% group_indices()
+users$method_id <- users %>% group_by(signup_method) %>% group_indices()
+countries$language_id <- countries %>% group_by(destination_language) %>% group_indices()
+users$country_id <- users %>% group_by(country_destination) %>% group_indices()
+users$user_country_id <- users %>% group_by(id, country_id) %>% group_indices()
+users$app_id <- users %>% group_by(signup_app) %>% group_indices()
+sessions$device_id <- sessions %>% group_by(device_type) %>% group_indices()
+sessions$action_id <- sessions %>% group_by(device_id, action, action_type, action_detail, secs_elapsed) %>% group_indices()
+
+# Add country_id to countries data.table by joining with users on country_destination and remove duplicates
+countries <- merge(countries, users[, .(country_destination, country_id)], by = 'country_destination', all.x = TRUE)
+countries <- countries[!duplicated(countries)]
+
+# Split data into tables to satisfy 3NF
+channel.table <- data.table(channel_id = users$channel_id, affiliate_channel = users$affiliate_channel)
+provider.table <- data.table(provider_id = users$provider_id, affiliate_provider = users$affiliate_provider)
+channel.provider.table <- data.table(channel_provider_id = users$channel_provider_id, channel_id = users$channel_id, 
+                                     provider_id = users$provider_id)
+browser.table <- data.table(browser_id = users$browser_id, browser = users$first_browser)
+signup.method.table <- data.table(method_id = users$method_id, signup_method = users$signup_method)
+language.table <- data.table(language_id = countries$language_id, language = countries$destination_language)
+country.table <- countries[, .(country_id, country = country_destination, lat_destination, lng_destination, distance_km, destination_km2, 
+                               language_id, language_levenshtein_distance)]
+signup.app.table <- data.table(app_id = users$app_id, signup_app = users$signup_app)
+device.table <- data.table(device_id = sessions$device_id, device_name = sessions$device_type)
+
+## Do not include device_id for devices from user table, because they differ from devices in sessions table and would violate referential integrity
+## We can still identify first device of each user and subsequent devices through joins in database
+
+user.info.table <- data.table(user_id = users$id, gender = users$gender, age = users$age, language = users$language, method_id = users$method_id,
+                              app_id = users$app_id, browser_id = users$browser_id, channel_provider_id = users$channel_provider_id)
+user.country.table <- data.table(user_country_id = users$user_country_id, user_id = users$id, country_id = users$country_id)
+
+# We cannot include timestamp_first_active, because we do not know the origin from which the integer is supposed to count time
+account.table <- users[, .(user_id = id, date_account_created, date_first_booking)]
+action.detail.table <- sessions[, .(action_id, device_id, action, action_type, action_detail, secs_elapsed)]
+user.action.table <- sessions[, .(user_id, action_id)]
+age.gender.bkts.table <- data.table(age_gender_bkts_id = age.gender.buckets$age_gender_bkts_id, age_bucket = age.gender.buckets$age_bucket, country_id = country.table$country_id, 
+                                    gender = age.gender.buckets$gender, year = age.gender.buckets$year, 
+                                    population_in_thousands = age.gender.buckets$population_in_thousands)
+
+# Remove duplicates
+channel.table <- channel.table[!duplicated(channel.table)]
+provider.table <- provider.table[!duplicated(provider.table)]
+channel.provider.table <- channel.provider.table[!duplicated(channel.provider.table)]
+browser.table <- browser.table[!duplicated(browser.table)]
+signup.method.table <- signup.method.table[!duplicated(signup.method.table)]
+language.table <- language.table[!duplicated(language.table)]
+country.table <- country.table[!duplicated(country.table)]
+signup.app.table <- signup.app.table[!duplicated(signup.app.table)]
+device.table <- device.table[!duplicated(device.table)]
+user.info.table <- user.info.table[!duplicated(user.info.table)]
+user.country.table <- user.country.table[!duplicated(user.country.table)]
+account.table <- account.table[!duplicated(account.table)]
+action.detail.table <- action.detail.table[!duplicated(action.detail.table)]
+user.action.table <- user.action.table[!duplicated(user.action.table)]
+age.gender.bkts.table <- age.gender.bkts.table[!duplicated(age.gender.bkts.table)]
+
+# Only include rows in user.country.info with countries that appear in country.table to satisfy referential integrity constraints
+user.country.table <- user.country.table[country_id %in% unique(country.table$country_id)]
+```
+
+``` {r establish_connection}
+# Load PostgreSQL driver
+drv <- dbDriver("Postgres")
+
+# Create a connection
+con <- dbConnect(drv,
+                 dbname = "airbnb",
+                 host = "localhost",
+                 port = 5432,
+                 user = rstudioapi::askForPassword("Database User"), # Protect username
+                 password = rstudioapi::askForPassword("Database Password")) # Protect password
+```
+
+``` {r create_tables}
+# Create fifteen tables in airbnb database for RDBMS in 3NF 
+## Use dbSendQuery because we are only executing the command and not trying to return a table
+### Channel Table
+create.channel.table <- dbSendQuery(con, "Create table channel (
+                                            channel_id  varchar(20),
+                                            affiliate_channel varchar(50),
+                                            Primary key (channel_id)
+                                          );")
+
+### Clear result to avoid throwing error
+dbClearResult(create.channel.table)
+
+### Provider Table
+create.provider.table <- dbSendQuery(con, "Create table provider (
+                                            provider_id varchar(20),
+                                            affiliate_provider varchar(50),
+                                            Primary key (provider_id)
+                                          );")
+
+### Clear result to avoid throwing error
+dbClearResult(create.provider.table)
+
+### Channel Provider Table
+create.channel.provider.table <- dbSendQuery(con, "Create table channel_provider (
+                                                    channel_provider_id  varchar(20),
+                                                    channel_id varchar(20),
+                                                    provider_id varchar(20),
+                                                    Primary key (channel_provider_id),
+                                                    foreign key (channel_id) references channel (channel_id),
+                                                    foreign key (provider_id) references provider (provider_id)
+                                                  );")
+
+### Clear result to avoid throwing error
+dbClearResult(create.channel.provider.table)
+
+### Browser Table
+create.browser.table <- dbSendQuery(con, "Create table browser (
+                                            browser_id varchar(20),
+                                            browser varchar(20),
+                                            Primary key (Browser_id) 
+                                          );")
+
+### Clear result to avoid throwing error
+dbClearResult(create.browser.table)
+
+### Signup Method Table
+create.signup.method.table <- dbSendQuery(con, "Create table signup_method (
+                                                  method_id varchar(20),
+                                                  signup_method varchar(20),
+                                                  Primary key(method_id)
+                                                );")
+
+### Clear result to avoid throwing error
+dbClearResult(create.signup.method.table)
+
+### Language Table
+create.language.table <- dbSendQuery(con, "Create table language (
+                                            language_id varchar(20),
+                                            language varchar(20),
+                                            Primary key (language_id)
+                                          );")
+
+### Clear result to avoid throwing error
+dbClearResult(create.language.table)
+
+### Country Table
+create.country.table <- dbSendQuery(con, "Create table country (
+                                            country_id varchar(20),
+                                            country varchar(50),
+                                            lat_destination numeric(9,6),
+                                            lng_destination numeric(9,6),
+                                            distance_km numeric(12,6),
+                                            destination_km2 numeric(9,1),
+                                            language_id varchar(20),
+                                            language_levenshtein_distance numeric(4,2),
+                                            Primary key (country_id),
+                                            Foreign key (language_id) references language(language_id)
+                                          );")
+
+### Clear result to avoid throwing error
+dbClearResult(create.country.table)
+
+### Signup App Table
+create.signup.app.table <- dbSendQuery(con, "Create table signup_app (
+                                              app_id varchar(20),
+                                              signup_app varchar(20),
+                                              Primary key(app_id)
+                                            );")
+
+### Clear result to avoid throwing error
+dbClearResult(create.signup.app.table)
+
+### Device Table
+create.device.table <- dbSendQuery(con, "Create table device (
+                                          device_id varchar(20),
+                                          device_name varchar(50),
+                                          Primary key(device_id)
+                                        );")
+
+### Clear result to avoid throwing error
+dbClearResult(create.device.table)
+
+### User Info Table
+create.user.info.table <- dbSendQuery(con, "Create table user_info (
+                                              user_id  varchar(20), 
+                                              gender varchar(20),
+                                              age int,
+                                              language varchar(20),
+                                              method_id varchar(20), 
+                                              app_id varchar(20),
+                                              browser_id varchar(20),
+                                              channel_provider_id varchar(20), 
+                                              Primary key (user_id), 
+                                              Foreign key (method_id) references  Signup_method(method_id),
+                                              Foreign key (app_id) references  signup_app(app_id),
+                                              Foreign key (browser_id) references browser (browser_id),
+                                              Foreign key (channel_provider_id) references channel_provider (channel_provider_id)
+                                            );")
+
+### Clear result to avoid throwing error
+dbClearResult(create.user.info.table)
+
+### User Country Table
+create.user.country.table <- dbSendQuery(con, "Create table user_country (
+                                                user_country_id varchar(20),
+                                                user_id varchar(20),
+                                                country_id varchar(20),
+                                                Primary key (user_country_id),
+                                                Foreign key (user_id) references user_info(user_id),
+                                                Foreign key(country_id) references country(country_id)
+                                              );")
+
+### Clear result to avoid throwing error
+dbClearResult(create.user.country.table)
+
+### Account Table
+create.account.table <- dbSendQuery(con, "Create table account (
+                                            user_id varchar(20),
+                                            date_account_created date,
+                                            date_first_booking date,
+                                            Primary key (user_id),
+                                            Foreign key(user_id) references user_info(user_id)
+                                          );")
+
+### Clear result to avoid throwing error
+dbClearResult(create.account.table)
+
+### Account Detail Table
+create.account.detail.table <- dbSendQuery(con, "Create table action_detail (
+                                                  action_id  varchar(20),
+                                                  device_id varchar(20),
+                                                  action varchar(50),
+                                                  action_type varchar(20),
+                                                  action_detail text,
+                                                  secs_elapsed numeric(8,1),
+                                                  Primary key (action_id),
+                                                  Foreign key(device_id) references device(device_id)
+                                                );")
+
+### Clear result to avoid throwing error
+dbClearResult(create.account.detail.table)
+
+### User Action Table
+create.user.action.table <- dbSendQuery(con, "Create table user_action ( 
+                                                user_id varchar(20),
+                                                action_id varchar(20),
+                                                Primary key(user_id, action_id),
+                                                Foreign key (user_id) references user_info(user_id),
+                                                Foreign key (action_id) references action_detail(action_id)
+                                              );")
+
+### Clear result to avoid throwing error
+dbClearResult(create.user.action.table)
+
+### Age Gender Buckets Table
+create.age.gender.bkts.table <- dbSendQuery(con, "Create table age_gender_bkts(
+                                                    age_gender_bkts_id varchar(20),
+                                                    age_bucket varchar(20),
+                                                    country_id varchar(20),
+                                                    gender varchar(20),
+                                                    year int,
+                                                    population_in_thousands numeric(6,1),
+                                                    Primary key(age_gender_bkts_id),
+                                                    Foreign key (country_id) references country(country_id)
+                                                  );")
+
+### Clear result to avoid throwing error
+dbClearResult(create.age.gender.bkts.table)
+```
+
+``` {r insert_data}
+# Insert data into tables
+dbWriteTable(con, "channel", channel.table, row.names = FALSE, append = TRUE)
+dbWriteTable(con, "provider", provider.table, row.names = FALSE, append = TRUE)
+dbWriteTable(con, "channel_provider", channel.provider.table, row.names = FALSE, append = TRUE)
+dbWriteTable(con, "browser", browser.table, row.names = FALSE, append = TRUE)
+dbWriteTable(con, "signup_method", signup.method.table, row.names = FALSE, append = TRUE)
+dbWriteTable(con, "language", language.table, row.names = FALSE, append = TRUE)
+dbWriteTable(con, "country", country.table, row.names = FALSE, append = TRUE)
+dbWriteTable(con, "signup_app", signup.app.table, row.names = FALSE, append = TRUE)
+dbWriteTable(con, "device", device.table, row.names = FALSE, append = TRUE)
+dbWriteTable(con, "user_info", user.info.table, row.names = FALSE, append = TRUE)
+dbWriteTable(con, "user_country", user.country.table, row.names = FALSE, append = TRUE)
+dbWriteTable(con, "account", account.table, row.names = FALSE, append = TRUE)
+dbWriteTable(con, "action_detail", action.detail.table, row.names = FALSE, append = TRUE)
+dbWriteTable(con, "user_action", user.action.table, row.names = FALSE, append = TRUE)
+dbWriteTable(con, "age_gender_bkts", age.gender.bkts.table, row.names = FALSE, append = TRUE)
+```
+
+``` {r close_connection}
+# Close the connection
+dbDisconnect(con)
+dbUnloadDriver(drv)
+```
